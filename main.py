@@ -1,6 +1,7 @@
 import time
 import YanAPI //teste
 
+
 # IP do robô
 ROBOT_IP = "127.0.0.1"
 
