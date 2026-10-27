@@ -1,0 +1,22 @@
+import YanAPI
+
+def ler_qr_code():
+    """Aciona a câmara para ler o QR Code e retorna o texto extraído ou None."""
+    resultado = YanAPI.sync_do_QR_code_recognition()
+    
+    if resultado and resultado.get("code") == 0:
+        dados = resultado.get("data", {})
+        qr_texto = dados.get("contents") or dados.get("content") or "none"
+        
+        if isinstance(qr_texto, list) and len(qr_texto) > 0:
+            qr_texto = qr_texto[0]
+            
+        texto_limpo = str(qr_texto).strip()
+        if texto_limpo and texto_limpo.lower() != "none":
+            return texto_limpo
+            
+    return None
+
+def ler_comando(mensagem):
+    """Lê um comando de texto inserido pelo usuário no terminal."""
+    return input(mensagem).strip().lower()
