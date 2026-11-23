@@ -2,121 +2,118 @@ import hashlib
 import json
 import os
 import time
-from facial_lbph import ReconhecedorFacial
-from yanshee_hw import YansheeHardware
+import YanAPI
 
-ARQUIVO_SENHA = "senha_config.json"
-MAX_TENTATIVAS = 3
-BLOQUEIO_SEG = 15
+# IP do robô
+ROBOT_IP = "127.0.0.1"
 
 
-def _hash_senha(senha, salt_hex):
-    salt = bytes.fromhex(salt_hex)
-    return hashlib.pbkdf2_hmac("sha256", senha.encode("utf-8"), salt, 100000).hex()
+def piscar_led_peito(cor, vezes=1):
+    """Faz o LED do botão do peito piscar na cor e quantidade especificadas."""
+    for _ in range(vezes):
+        # Liga o LED na cor escolhida
+        YanAPI.sync_set_led(type="button", color=cor, mode="on")
+        time.sleep(0.5)
+        # Desliga o LED
+        YanAPI.sync_set_led(type="button", color=cor, mode="off")
+        time.sleep(0.5)
 
 
-def salvar_senha(senha_4):
-    if not (senha_4.isdigit() and len(senha_4) == 4):
-        return False, "A senha deve ter exatamente 4 digitos numericos."
-    salt_hex = os.urandom(16).hex()
-    dados = {
-        "salt": salt_hex,
-        "hash": _hash_senha(senha_4, salt_hex),
-        "falhas": 0,
-        "bloqueado_ate": 0.0,
-    }
-    with open(ARQUIVO_SENHA, "w", encoding="utf-8") as f:
-        json.dump(dados, f, indent=2)
-    return True, "Senha de 4 digitos salva com sucesso."
+def ler_qr_code():
+    """Aciona a câmara para ler o QR Code e retorna o texto extraído ou None."""
+    resultado = YanAPI.sync_do_QR_code_recognition()
+    
+    if resultado and resultado.get("code") == 0:
+        dados = resultado.get("data", {})
+        qr_texto = dados.get("contents") or dados.get("content") or "none"
+        
+        if isinstance(qr_texto, list) and len(qr_texto) > 0:
+            qr_texto = qr_texto[0]
+            
+        texto_limpo = str(qr_texto).strip()
+        # Retorna o texto se não for "none" ou vazio
+        if texto_limpo and texto_limpo.lower() != "none":
+            return texto_limpo
+            
+    return None
 
 
-def verificar_senha(senha_lida):
-    if not os.path.exists(ARQUIVO_SENHA):
-        return False, "Nenhuma senha cadastrada."
-    with open(ARQUIVO_SENHA, "r", encoding="utf-8") as f:
-        dados = json.load(f)
-
-    agora = time.time()
-    if agora < float(dados.get("bloqueado_ate", 0.0)):
-        restante = int(round(float(dados["bloqueado_ate"]) - agora))
-        return False, "Bloqueado. Aguarde {}s.".format(restante)
-
-    if _hash_senha(senha_lida, dados["salt"]) == dados["hash"]:
-        dados["falhas"] = 0
-        dados["bloqueado_ate"] = 0.0
-        with open(ARQUIVO_SENHA, "w", encoding="utf-8") as f:
-            json.dump(dados, f, indent=2)
-        return True, "Senha correta. Acesso liberado."
-
-    falhas = int(dados.get("falhas", 0)) + 1
-    if falhas >= MAX_TENTATIVAS:
-        dados["falhas"] = 0
-        dados["bloqueado_ate"] = agora + BLOQUEIO_SEG
-        msg = "Limite de tentativas atingido. Bloqueado por {}s.".format(BLOQUEIO_SEG)
-    else:
-        dados["falhas"] = falhas
-        msg = "Senha incorreta. Tentativas restantes: {}.".format(MAX_TENTATIVAS - falhas)
-
-    with open(ARQUIVO_SENHA, "w", encoding="utf-8") as f:
-        json.dump(dados, f, indent=2)
-    return False, msg
+def ler_sequencia(quantidade=4):
+    """Realiza múltiplas leituras de QR codes em sequência e junta os resultados."""
+    sequencia = ""
+    
+    for i in range(1, quantidade + 1):
+        print("\nAponte o {}º QR Code para a câmara...".format(i))
+        lido = None
+        
+        # Fica em loop a tentar ler até que um código válido apareça na câmara
+        while lido is None:
+            lido = ler_qr_code()
+            if lido is None:
+                time.sleep(0.5) # Pausa curta antes de tentar capturar a imagem novamente
+                
+        print("-> {}º código lido: {}".format(i, lido))
+        sequencia += lido
+        piscar_led_peito("blue", 1) # Pisca azul para confirmar que leu este dígito
+        
+        # Se não for o último dígito, dá um tempo para trocar o QR code
+        if i < quantidade:
+            print("Retire o QR code. Prepare o próximo (3 segundos)...")
+            time.sleep(3)
+            
+    return sequencia
 
 
-def autenticar(hw, facial):
-    hw.falar("Verificando rosto")
-    ok_rosto, nome, info = facial.verificar_janela(timeout_seg=5.0)
-    if ok_rosto:
-        hw.set_led("green", duracao=2.0)
-        hw.falar("Acesso liberado para {}".format(nome))
-        print("[OK] Reconhecido: {} ({})".format(nome, info))
-        return True
+def main():
+    # Inicializa a comunicação com o robô
+    YanAPI.yan_api_init(ROBOT_IP)
+    
+    senha_salva = None
+    print("=== Sistema de Segurança Yanshee ===")
 
-    print("[FALLBACK] {} -> Solicitando senha de 4 digitos.".format(info))
-    hw.set_led("red", duracao=0.8)
-    hw.falar("Rosto nao reconhecido. Digite a senha.")
+    # Fase 1: Gravar a primeira senha
+    while senha_salva is None:
+        comando = input("\nDigite 'G' e pressione Enter para gravar a senha inicial (4 leituras): ").strip().lower()
+        
+        if comando == 'g':
+            print("\n--- A GRAVAR SENHA INICIAL ---")
+            senha_salva = ler_sequencia(4)
+            print("\nSenha inicial gravada no sistema: {}".format(senha_salva))
+            piscar_led_peito("blue", 2)
+        else:
+            print("Comando inválido. Use 'G' para gravar.")
 
-    senha = input("Digite a senha de 4 digitos: ").strip()
-    ok_senha, msg_senha = verificar_senha(senha)
-    if ok_senha:
-        hw.set_led("green", duracao=2.0)
-        hw.falar("Acesso liberado")
-        print("[OK]", msg_senha)
-        return True
-
-    hw.set_led("red", duracao=2.0)
-    hw.falar("Acesso negado")
-    print("[ERRO]", msg_senha)
-    return False
-
-
-def menu():
-    hw = YansheeHardware(camera_index=0)
-    facial = ReconhecedorFacial(hw, limiar_confianca=65.0)
-
+    # Fase 2: Modo de operação contínuo (Verificar, Redefinir ou Sair)
+    print("\n=== Modo de Operação Ativado ===")
     while True:
-        print("\n=== YANSHEE - ACESSO FACIAL + SENHA ===")
-        print("1 - Autenticar (Rosto -> Senha)")
-        print("2 - Cadastrar rosto")
-        print("3 - Cadastrar / alterar senha (4 digitos)")
-        print("0 - Sair")
-        opc = input("Escolha: ").strip()
-
-        if opc == "1":
-            autenticar(hw, facial)
-        elif opc == "2":
-            nome = input("Nome da pessoa: ").strip()
-            if nome:
-                ok, msg = facial.cadastrar(nome)
-                print(msg)
-        elif opc == "3":
-            s = input("Nova senha (4 digitos): ").strip()
-            ok, msg = salvar_senha(s)
-            print(msg)
-        elif opc == "0":
+        comando = input("\nOpções:\n[A] Testar senha\n[G] Gravar nova senha\n[S] Sair\nEscolha: ").strip().lower()
+        
+        if comando == 'a':
+            print("\n--- A VERIFICAR SENHA ---")
+            tentativa = ler_sequencia(4)
+            
+            print("\nSenha introduzida: {}".format(tentativa))
+            
+            if tentativa == senha_salva:
+                print("ACESSO CONCEDIDO: A senha está correta!")
+                piscar_led_peito("green", 3)
+            else:
+                print("ACESSO NEGADO: Senha incorreta!")
+                piscar_led_peito("red", 3)
+                
+        elif comando == 'g':
+            print("\n--- A REDEFINIR SENHA ---")
+            nova_senha = ler_sequencia(4)
+            senha_salva = nova_senha
+            print("\nNova senha ({}) gravada com sucesso e a substituir a anterior!".format(senha_salva))
+            piscar_led_peito("blue", 2)
+                
+        elif comando == 's':
+            print("A encerrar o sistema de segurança...")
             break
         else:
             print("Opcao invalida.")
 
 
 if __name__ == "__main__":
-    menu()
+    main()
