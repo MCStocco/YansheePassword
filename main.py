@@ -1,28 +1,53 @@
+import argparse
+from datetime import datetime
+from functools import partial
 import hashlib
 import json
 import os
+import shutil
+import sys
+import tempfile
 import time
-import YanAPI
+from types import SimpleNamespace
+
+try:
+    import YanAPI
+except ImportError as erro:
+    YanAPI = None
+    ERRO_IMPORTACAO = str(erro)
 
 ARQUIVO_SENHA = "senha_config.json"
 PASTA_IMAGENS = "rostos_salvos"
+PASTA_FOTOS_ROBO = "/tmp/photo"
 MAX_TENTATIVAS = 3
 BLOQUEIO_SEG = 15
+PRAZO_RECONHECIMENTO = 10.0
+PRAZO_VOZ = 4.0
+PRAZO_HTTP = (3, 8)
 
 
 def inicializar_api(robot_ip=None):
-    """Inicializa a YanAPI caso seja informado um IP externo."""
-    if robot_ip:
-        YanAPI.yan_api_init(robot_ip)
+    import requests
+
+    YanAPI.yan_api_init(robot_ip or "127.0.0.1")
+    # Limita as chamadas deste SDK sem editar YanAPI.py nem alterar o módulo requests.
+    YanAPI.requests = SimpleNamespace(
+        get=partial(requests.get, timeout=PRAZO_HTTP),
+        post=partial(requests.post, timeout=PRAZO_HTTP),
+        put=partial(requests.put, timeout=PRAZO_HTTP),
+        delete=partial(requests.delete, timeout=PRAZO_HTTP),
+    )
 
 
 def falar(texto, aguardar=False):
     """Aciona a síntese de voz (TTS) do Yanshee com proteção contra falhas."""
     try:
+        timestamp = int(time.time())
+        resposta = YanAPI.start_voice_tts(tts=texto, interrupt=True, timestamp=timestamp)
+        _conferir_resposta("start_voice_tts", resposta)
         if aguardar:
-            YanAPI.sync_do_tts(tts=texto, interrupt=True)
-        else:
-            YanAPI.start_voice_tts(tts=texto, interrupt=True)
+            _aguardar_tarefa("get_voice_tts_state", YanAPI.get_voice_tts_state,
+                            (timestamp,), timestamp, PRAZO_VOZ)
     except Exception as e:
         print("[AVISO TTS]:", e)
 
@@ -55,98 +80,102 @@ def _formatar_erro_api(resposta):
     return "raw={}".format(resposta)
 
 
-def cadastrar_rosto_yanapi(nome, resolucao="640x480"):
-    """
-    Tira foto via YanAPI, salva cópia local em rostos_salvos/,
-    envia amostra e registra a tag no serviço facial do robô.
-    """
-    if not os.path.exists(PASTA_IMAGENS):
-        os.makedirs(PASTA_IMAGENS)
+def _conferir_resposta(etapa, resposta):
+    if not isinstance(resposta, dict) or resposta.get("code") not in (0, "0"):
+        raise RuntimeError("{}: {}".format(etapa, _formatar_erro_api(resposta)))
+    return resposta
 
-    falar("Olhe para a camera para cadastrar o rosto", aguardar=True)
-    time.sleep(0.5)
 
-    # 1. Tirar foto no robô (/tmp/photo)
+def _aguardar_tarefa(etapa, obter, argumentos, timestamp, prazo):
+    limite = time.monotonic() + prazo
+    resposta = None
+    while time.monotonic() < limite:
+        resposta = _conferir_resposta(etapa, obter(*argumentos))
+        if str(resposta.get("timestamp")) == str(timestamp) and resposta.get("status") == "idle":
+            return resposta
+        time.sleep(0.25)
+    raise RuntimeError("{}: prazo de {}s excedido ({})".format(
+        etapa, prazo, _formatar_erro_api(resposta)))
+
+
+def _ler_imagem(caminho):
+    with open(caminho, "rb") as arquivo:
+        dados = arquivo.read()
+    if dados.startswith(b"\xff\xd8\xff") and dados.endswith(b"\xff\xd9"):
+        return ".jpg"
+    if dados.startswith(b"\x89PNG\r\n\x1a\n") and dados.endswith(b"IEND\xaeB`\x82"):
+        return ".png"
+    raise ValueError("Resposta sem assinatura de JPEG ou PNG completo: {!r}".format(dados[:120]))
+
+
+def _capturar_foto(pasta_temporaria, resolucao):
+    print("[CAMERA] take_vision_photo ({})".format(resolucao), flush=True)
     try:
-        res_foto = YanAPI.take_vision_photo(resolution=resolucao)
-    except Exception as e:
-        sinalizar_led_botao("red", modo="blink", duracao=1.5)
-        return False, "Excecao em take_vision_photo: {}".format(e)
+        resposta = YanAPI.take_vision_photo(resolution=resolucao)
+    except Exception as erro:
+        raise RuntimeError("take_vision_photo: {}".format(erro))
+    _conferir_resposta("take_vision_photo", resposta)
+    data = resposta.get("data")
+    nome_arquivo = data.get("name") if isinstance(data, dict) else None
+    if (not isinstance(nome_arquivo, str) or nome_arquivo in ("", ".", "..")
+            or os.path.basename(nome_arquivo) != nome_arquivo or "\x00" in nome_arquivo):
+        raise RuntimeError("take_vision_photo: nome de arquivo invalido ({})".format(
+            _formatar_erro_api(resposta)))
 
-    print("[DEBUG take_vision_photo]:", _formatar_erro_api(res_foto))
-    if not isinstance(res_foto, dict) or res_foto.get("code") != 0:
-        sinalizar_led_botao("red", modo="blink", duracao=1.5)
-        return False, "Falha ao tirar foto ({})".format(_formatar_erro_api(res_foto))
-
-    data_foto = res_foto.get("data") or {}
-    nome_arquivo_remoto = data_foto.get("name")
-    if not nome_arquivo_remoto:
-        sinalizar_led_botao("red", modo="blink", duracao=1.5)
-        return False, "API nao retornou o nome da foto ({})".format(_formatar_erro_api(res_foto))
-
-    # 2. Baixar foto e salvar localmente na pasta rostos_salvos/
-    carimbo = time.strftime("%Y%m%d_%H%M%S")
-    ext = os.path.splitext(nome_arquivo_remoto)[1] or ".jpg"
-    nome_local = "{}_{}{}".format(_nome_seguro(nome), carimbo, ext)
-    caminho_local = os.path.join(PASTA_IMAGENS, nome_local)
-    caminho_temp_raiz = os.path.join(".", nome_arquivo_remoto)
-
+    caminho = os.path.join(pasta_temporaria, nome_arquivo)
+    print("[CAMERA] get_vision_photo ({})".format(nome_arquivo), flush=True)
     try:
-        conteudo_img = YanAPI.get_vision_photo(nome_arquivo_remoto, "./")
-    except Exception as e:
-        sinalizar_led_botao("red", modo="blink", duracao=1.5)
-        return False, "Excecao em get_vision_photo: {}".format(e)
-
-    if isinstance(conteudo_img, (bytes, bytearray)) and len(conteudo_img) > 0:
-        with open(caminho_local, "wb") as fp:
-            fp.write(conteudo_img)
-    elif os.path.exists(caminho_temp_raiz):
-        os.rename(caminho_temp_raiz, caminho_local)
-
-    # Remove arquivo temporário na raiz caso tenha ficado lá
-    if os.path.exists(caminho_temp_raiz) and os.path.abspath(caminho_temp_raiz) != os.path.abspath(caminho_local):
+        # O SDK concatena savePath + name e grava a própria resposta em disco.
+        YanAPI.get_vision_photo(nome_arquivo, pasta_temporaria + os.sep)
+        extensao = _ler_imagem(caminho)
+    except Exception as erro_download:
+        # Quando o script roda no próprio robô, a captura também pode estar em /tmp/photo.
+        origem = os.path.join(PASTA_FOTOS_ROBO, nome_arquivo)
+        if YanAPI.ip not in ("127.0.0.1", "localhost") or not os.path.isfile(origem):
+            raise RuntimeError("get_vision_photo: {}".format(erro_download))
         try:
-            os.remove(caminho_temp_raiz)
-        except Exception:
-            pass
+            shutil.copyfile(origem, caminho)
+            extensao = _ler_imagem(caminho)
+        except (OSError, ValueError) as erro_local:
+            raise RuntimeError("get_vision_photo: {}; arquivo em /tmp/photo: {}".format(
+                erro_download, erro_local))
+        print("[CAMERA] Arquivo recuperado de {} ({})".format(origem, erro_download))
+    return caminho, extensao
 
-    if not os.path.exists(caminho_local) or os.path.getsize(caminho_local) == 0:
-        sinalizar_led_botao("red", modo="blink", duracao=1.5)
-        return False, "Foto nao foi salva localmente em '{}'".format(caminho_local)
 
-    print("[INFO] Imagem salva em:", caminho_local)
+def _processar_foto(nome, resolucao, cadastrar):
+    os.makedirs(PASTA_IMAGENS, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=PASTA_IMAGENS) as pasta_temporaria:
+        amostra, extensao = _capturar_foto(pasta_temporaria, resolucao)
+        nome_local = "{}_{:%Y%m%d_%H%M%S_%f}{}".format(_nome_seguro(nome), datetime.now(), extensao)
+        caminho_local = os.path.abspath(os.path.join(PASTA_IMAGENS, nome_local))
+        foto_para_salvar = amostra
+        if cadastrar:
+            with tempfile.NamedTemporaryFile(dir=pasta_temporaria, delete=False) as copia:
+                with open(amostra, "rb") as arquivo:
+                    shutil.copyfileobj(arquivo, copia)
+            foto_para_salvar = copia.name
+        os.replace(foto_para_salvar, caminho_local)
+        print("[CAMERA] Imagem salva em: {}".format(caminho_local), flush=True)
+        if cadastrar:
+            print("[CADASTRO] upload_vision_photo_sample", flush=True)
+            _conferir_resposta("upload_vision_photo_sample", YanAPI.upload_vision_photo_sample(amostra))
+            print("[CADASTRO] set_vision_tag ({})".format(nome), flush=True)
+            # O arquivo temporário mantém o nome original, como em do_face_entry.
+            _conferir_resposta("set_vision_tag", YanAPI.set_vision_tag([os.path.basename(amostra)], nome))
+    return caminho_local
 
-    # 3. Enviar amostra para o banco de visão do Yanshee
+
+def cadastrar_rosto_yanapi(nome, resolucao="640x480"):
+    """Captura uma imagem local e registra a amostra no serviço facial do robô."""
+    print("Olhe para a camera para cadastrar o rosto.", flush=True)
+    falar("Olhe para a camera para cadastrar o rosto")
+    time.sleep(1.5)
     try:
-        res_upload = YanAPI.upload_vision_photo_sample(caminho_local)
-    except Exception as e:
+        caminho_local = _processar_foto(nome, resolucao, cadastrar=True)
+    except Exception as erro:
         sinalizar_led_botao("red", modo="blink", duracao=1.5)
-        return False, (
-            "Imagem salva em '{}', mas houve excecao em upload_vision_photo_sample: {}"
-        ).format(caminho_local, e)
-
-    print("[DEBUG upload_vision_photo_sample]:", _formatar_erro_api(res_upload))
-    if not isinstance(res_upload, dict) or res_upload.get("code") != 0:
-        sinalizar_led_botao("red", modo="blink", duracao=1.5)
-        return False, (
-            "Imagem salva em '{}', mas falhou ao enviar amostra ({})"
-        ).format(caminho_local, _formatar_erro_api(res_upload))
-
-    # 4. Associar o nome (tag) à amostra enviada
-    try:
-        res_tag = YanAPI.set_vision_tag([nome_arquivo_remoto], nome)
-    except Exception as e:
-        sinalizar_led_botao("red", modo="blink", duracao=1.5)
-        return False, (
-            "Imagem salva em '{}' e amostra enviada, mas houve excecao em set_vision_tag: {}"
-        ).format(caminho_local, e)
-
-    print("[DEBUG set_vision_tag]:", _formatar_erro_api(res_tag))
-    if not isinstance(res_tag, dict) or res_tag.get("code") != 0:
-        sinalizar_led_botao("red", modo="blink", duracao=1.5)
-        return False, (
-            "Imagem salva em '{}' e amostra enviada, mas falhou ao associar tag '{}' ({})"
-        ).format(caminho_local, nome, _formatar_erro_api(res_tag))
+        return False, "Falha no cadastro de rosto: {}".format(erro)
 
     sinalizar_led_botao("green", modo="breath", duracao=1.5)
     falar("Rosto de {} cadastrado".format(nome), aguardar=True)
@@ -154,26 +183,18 @@ def cadastrar_rosto_yanapi(nome, resolucao="640x480"):
 
 
 def _extrair_nome_rosto(resultado):
-    """Extrai o nome reconhecido do retorno de sync_do_face_recognition('recognition')."""
-    if not isinstance(resultado, dict) or resultado.get("code") != 0:
+    """Extrai o nome do resultado da tarefa de reconhecimento."""
+    if not isinstance(resultado, dict) or resultado.get("code") not in (0, "0"):
         return None
 
-    data = resultado.get("data") or {}
-    rec = data.get("recognition")
-    if isinstance(rec, dict):
-        nome = (rec.get("name") or "").strip()
-        if nome and nome.lower() != "none":
-            return nome
-    elif isinstance(rec, str):
-        nome = rec.strip()
-        if nome and nome.lower() != "none":
-            return nome
-
-    analysis = data.get("analysis")
-    if isinstance(analysis, dict):
-        nome = (analysis.get("name") or "").strip()
-        if nome and nome.lower() != "none":
-            return nome
+    data = resultado.get("data")
+    if not isinstance(data, dict):
+        return None
+    for campo in ("recognition", "analysis"):
+        valor = data.get(campo)
+        nome = valor.get("name") if isinstance(valor, dict) else valor
+        if isinstance(nome, str) and nome.strip() and nome.strip().lower() != "none":
+            return nome.strip()
 
     return None
 
@@ -183,15 +204,24 @@ def reconhecer_rosto_yanapi():
     Executa reconhecimento facial via YanAPI.
     Retorna (reconhecido: bool, nome: str or None, bruto: dict or None).
     """
+    tipo = "recognition"
+    timestamp = int(time.time())
+    iniciada = False
     try:
-        res = YanAPI.sync_do_face_recognition("recognition")
-    except Exception as e:
-        return False, None, {"erro": str(e)}
+        inicio = YanAPI.start_face_recognition(tipo, timestamp)
+        _conferir_resposta("start_face_recognition", inicio)
+        iniciada = True
+        res = _aguardar_tarefa("get_visual_task_result", YanAPI.get_visual_task_result,
+                               ("face", tipo), timestamp, PRAZO_RECONHECIMENTO)
+    except Exception as erro:
+        return False, None, {"msg": str(erro)}
     finally:
-        try:
-            YanAPI.stop_face_recognition("recognition")
-        except Exception:
-            pass
+        if iniciada:
+            try:
+                fim = YanAPI.stop_face_recognition(tipo, timestamp)
+                _conferir_resposta("stop_face_recognition", fim)
+            except Exception as erro:
+                print("[AVISO CAMERA]:", erro)
 
     nome = _extrair_nome_rosto(res)
     if nome:
@@ -287,10 +317,7 @@ def autenticar():
     return False
 
 
-def menu():
-    # Se rodar de um computador remoto, informe o IP do robô: inicializar_api("192.168.x.x")
-    inicializar_api(None)
-
+def menu(resolucao="640x480"):
     while True:
         print("\n=== YANSHEE - RECONHECIMENTO FACIAL + SENHA ===")
         print("1 - Autenticar (Rosto -> Senha)")
@@ -304,7 +331,7 @@ def menu():
         elif opc == "2":
             nome = input("Nome para gravar o rosto: ").strip()
             if nome:
-                ok, msg = cadastrar_rosto_yanapi(nome)
+                ok, msg = cadastrar_rosto_yanapi(nome, resolucao)
                 print(msg)
             else:
                 print("Nome invalido.")
@@ -318,5 +345,35 @@ def menu():
             print("Opcao invalida.")
 
 
+def main():
+    parser = argparse.ArgumentParser(description="Reconhecimento facial e senha no Yanshee")
+    parser.add_argument("--ip", default="127.0.0.1", help="IP do robo (padrao: 127.0.0.1)")
+    parser.add_argument("--resolucao", default="640x480", help="Resolucao da foto (padrao: 640x480)")
+    parser.add_argument("--testar-camera", action="store_true", help="Tira e salva uma foto de teste")
+    args = parser.parse_args()
+
+    if YanAPI is None:
+        print("[ERRO] Falha ao importar YanAPI: {}".format(ERRO_IMPORTACAO), file=sys.stderr)
+        return 1
+
+    inicializar_api(args.ip)
+    if args.testar_camera:
+        print("[DIAGNOSTICO] Python {} | {}".format(sys.version.split()[0], YanAPI.basic_url), flush=True)
+        print("[DIAGNOSTICO] YanAPI: {}".format(YanAPI.__file__), flush=True)
+        print("[DIAGNOSTICO] get_robot_battery_info", flush=True)
+        try:
+            _conferir_resposta("get_robot_battery_info", YanAPI.get_robot_battery_info())
+        except Exception as erro:
+            print("[AVISO] Falha na consulta da bateria: {}".format(erro), flush=True)
+        try:
+            _processar_foto("teste_camera", args.resolucao, cadastrar=False)
+        except Exception as erro:
+            print("[ERRO CAMERA] {}".format(erro), file=sys.stderr)
+            return 1
+    else:
+        menu(args.resolucao)
+    return 0
+
+
 if __name__ == "__main__":
-    menu()
+    sys.exit(main())
