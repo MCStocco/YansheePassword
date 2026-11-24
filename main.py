@@ -1,4 +1,5 @@
 import argparse
+from contextlib import closing
 from datetime import datetime
 from functools import partial
 import hashlib
@@ -24,6 +25,7 @@ BLOQUEIO_SEG = 15
 PRAZO_RECONHECIMENTO = 10.0
 PRAZO_VOZ = 4.0
 PRAZO_HTTP = (3, 8)
+LIMITE_QUADRO = 4 * 1024 * 1024
 
 
 def inicializar_api(robot_ip=None):
@@ -114,6 +116,10 @@ def _capturar_foto(pasta_temporaria, resolucao):
         resposta = YanAPI.take_vision_photo(resolution=resolucao)
     except Exception as erro:
         raise RuntimeError("take_vision_photo: {}".format(erro))
+    if isinstance(resposta, dict) and resposta.get("code") in (5, "5"):
+        raise RuntimeError("take_vision_photo: {}. Confira o espaco em /tmp no robo. "
+                           "Para testar o video ao vivo, use --testar-camera --via-stream.".format(
+                               _formatar_erro_api(resposta)))
     _conferir_resposta("take_vision_photo", resposta)
     data = resposta.get("data")
     nome_arquivo = data.get("name") if isinstance(data, dict) else None
@@ -143,10 +149,58 @@ def _capturar_foto(pasta_temporaria, resolucao):
     return caminho, extensao
 
 
-def _processar_foto(nome, resolucao, cadastrar):
+def _ler_quadro_mjpeg(resposta):
+    resposta.raise_for_status()
+    inicio_jpeg = b"\xff\xd8\xff"
+    fim_jpeg = b"\xff\xd9"
+    limite = time.monotonic() + PRAZO_HTTP[1]
+    buffer = bytearray()
+    inicio_encontrado = False
+    for bloco in resposta.iter_content(chunk_size=4096):
+        buffer.extend(bloco)
+        if not inicio_encontrado:
+            inicio = buffer.find(inicio_jpeg)
+            if inicio < 0:
+                del buffer[:-2]
+                if time.monotonic() >= limite:
+                    break
+                continue
+            del buffer[:inicio]
+            inicio_encontrado = True
+        fim = buffer.find(fim_jpeg, 3)
+        if 0 < fim and fim + 2 <= LIMITE_QUADRO:
+            return buffer[:fim + 2]
+        if len(buffer) > LIMITE_QUADRO or time.monotonic() >= limite:
+            break
+    raise RuntimeError("O stream MJPEG nao retornou um quadro JPEG completo dentro do limite.")
+
+
+def _capturar_foto_stream(pasta_temporaria, resolucao):
+    print("[CAMERA] open_vision_stream ({})".format(resolucao), flush=True)
+    _conferir_resposta("open_vision_stream", YanAPI.open_vision_stream(resolution=resolucao))
+    try:
+        url = "http://{}:8000/stream.mjpg".format(YanAPI.ip)
+        print("[CAMERA] Lendo quadro de {}".format(url), flush=True)
+        time.sleep(0.5)
+        with closing(YanAPI.requests.get(url=url, stream=True)) as resposta:
+            quadro = _ler_quadro_mjpeg(resposta)
+        nome_arquivo = "stream_{:%Y%m%d_%H%M%S_%f}.jpg".format(datetime.now())
+        caminho = os.path.join(pasta_temporaria, nome_arquivo)
+        with open(caminho, "wb") as arquivo:
+            arquivo.write(quadro)
+        return caminho, ".jpg"
+    finally:
+        try:
+            _conferir_resposta("close_vision_stream", YanAPI.close_vision_stream())
+        except Exception as erro:
+            print("[AVISO CAMERA]:", erro)
+
+
+def _processar_foto(nome, resolucao, cadastrar, via_stream=False):
     os.makedirs(PASTA_IMAGENS, exist_ok=True)
+    capturar = _capturar_foto_stream if via_stream else _capturar_foto
     with tempfile.TemporaryDirectory(dir=PASTA_IMAGENS) as pasta_temporaria:
-        amostra, extensao = _capturar_foto(pasta_temporaria, resolucao)
+        amostra, extensao = capturar(pasta_temporaria, resolucao)
         nome_local = "{}_{:%Y%m%d_%H%M%S_%f}{}".format(_nome_seguro(nome), datetime.now(), extensao)
         caminho_local = os.path.abspath(os.path.join(PASTA_IMAGENS, nome_local))
         foto_para_salvar = amostra
@@ -161,18 +215,18 @@ def _processar_foto(nome, resolucao, cadastrar):
             print("[CADASTRO] upload_vision_photo_sample", flush=True)
             _conferir_resposta("upload_vision_photo_sample", YanAPI.upload_vision_photo_sample(amostra))
             print("[CADASTRO] set_vision_tag ({})".format(nome), flush=True)
-            # O arquivo temporário mantém o nome original, como em do_face_entry.
+            # A etiqueta precisa usar o mesmo nome de arquivo enviado no upload.
             _conferir_resposta("set_vision_tag", YanAPI.set_vision_tag([os.path.basename(amostra)], nome))
     return caminho_local
 
 
-def cadastrar_rosto_yanapi(nome, resolucao="640x480"):
+def cadastrar_rosto_yanapi(nome, resolucao="640x480", via_stream=False):
     """Captura uma imagem local e registra a amostra no serviço facial do robô."""
     print("Olhe para a camera para cadastrar o rosto.", flush=True)
     falar("Olhe para a camera para cadastrar o rosto")
     time.sleep(1.5)
     try:
-        caminho_local = _processar_foto(nome, resolucao, cadastrar=True)
+        caminho_local = _processar_foto(nome, resolucao, cadastrar=True, via_stream=via_stream)
     except Exception as erro:
         sinalizar_led_botao("red", modo="blink", duracao=1.5)
         return False, "Falha no cadastro de rosto: {}".format(erro)
@@ -317,7 +371,7 @@ def autenticar():
     return False
 
 
-def menu(resolucao="640x480"):
+def menu(resolucao="640x480", via_stream=False):
     while True:
         print("\n=== YANSHEE - RECONHECIMENTO FACIAL + SENHA ===")
         print("1 - Autenticar (Rosto -> Senha)")
@@ -331,7 +385,7 @@ def menu(resolucao="640x480"):
         elif opc == "2":
             nome = input("Nome para gravar o rosto: ").strip()
             if nome:
-                ok, msg = cadastrar_rosto_yanapi(nome, resolucao)
+                ok, msg = cadastrar_rosto_yanapi(nome, resolucao, via_stream)
                 print(msg)
             else:
                 print("Nome invalido.")
@@ -350,6 +404,7 @@ def main():
     parser.add_argument("--ip", default="127.0.0.1", help="IP do robo (padrao: 127.0.0.1)")
     parser.add_argument("--resolucao", default="640x480", help="Resolucao da foto (padrao: 640x480)")
     parser.add_argument("--testar-camera", action="store_true", help="Tira e salva uma foto de teste")
+    parser.add_argument("--via-stream", action="store_true", help="Captura um quadro do video MJPEG do robo")
     args = parser.parse_args()
 
     if YanAPI is None:
@@ -366,12 +421,12 @@ def main():
         except Exception as erro:
             print("[AVISO] Falha na consulta da bateria: {}".format(erro), flush=True)
         try:
-            _processar_foto("teste_camera", args.resolucao, cadastrar=False)
+            _processar_foto("teste_camera", args.resolucao, cadastrar=False, via_stream=args.via_stream)
         except Exception as erro:
             print("[ERRO CAMERA] {}".format(erro), file=sys.stderr)
             return 1
     else:
-        menu(args.resolucao)
+        menu(args.resolucao, args.via_stream)
     return 0
 
 
